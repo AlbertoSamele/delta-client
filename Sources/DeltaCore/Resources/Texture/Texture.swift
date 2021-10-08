@@ -94,6 +94,11 @@ public struct Texture {
     if self.type == .translucent {
       unpremultiply()
     }
+    
+    // If `type` parameter is opaque then force all pixels to opaque. (note that this is not self.type)
+    if type == .opaque {
+      forceOpaque()
+    }
   }
   
   /// Loads a texture animation from a json file in a resource pack, and then sets is as this texture's animation
@@ -198,6 +203,20 @@ public struct Texture {
           b: UInt8(b),
           a: pixel.a)
         setPixel(atX: x, y: y, to: newPixel)
+      }
+    }
+  }
+  
+  /// Make all pixels opaque.
+  private mutating func forceOpaque() {
+    for x in 0..<width {
+      for y in 0..<height {
+        var pixel = getPixel(atX: x, y: y)
+        
+        if pixel.a != 255 {
+          pixel.a = 255
+          setPixel(atX: x, y: y, to: pixel)
+        }
       }
     }
   }

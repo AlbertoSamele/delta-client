@@ -84,6 +84,7 @@ public struct TexturePalette {
       do {
         // Hardcode leaves as opaque for performance reasons
         let hardcodeOpaque = identifier.name.hasSuffix("leaves")
+        // TODO: don't hardcode leaves as opaque, make a more generic solution
         
         var texture = try Texture(
           image: image,
