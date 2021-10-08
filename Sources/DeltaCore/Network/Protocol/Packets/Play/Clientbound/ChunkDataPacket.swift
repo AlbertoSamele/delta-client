@@ -76,9 +76,8 @@ public struct ChunkDataPacket: ClientboundPacket {
   }
   
   public func handle(for client: Client) throws {
-    if let existingChunk = client.server?.world.chunk(at: position) {
-      existingChunk.update(with: self)
-      client.server?.world.eventBatch.add(World.Event.UpdateChunk(position: position))
+    if client.server?.world.chunkExists(at: position) == true {
+      client.server?.world.updateChunk(at: position, with: self)
     } else {
       let chunk = Chunk(self)
       client.server?.world.addChunk(chunk, at: position)

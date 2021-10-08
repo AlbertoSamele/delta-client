@@ -4,27 +4,41 @@ import simd
 
 /// A renderer that renders a `World`
 class WorldRenderer {
-  /// Render pipeline used for transparent and opaque geometry (non-translucent).
-  var transparentAndOpaquePipelineState: MTLRenderPipelineState
-  /// Render pipeline used for translucent geometry.
-  var translucentPipelineState: MTLRenderPipelineState
+  var world: World
+  var client: Client
+  
+  // MARK: Rendering pipeline
+  
+  /// Render pipeline used for rendering blocks.
+  var renderPipelineState: MTLRenderPipelineState
   /// Depth stencil.
   var depthState: MTLDepthStencilState
   
+  var camera = Camera()
+  
+  // MARK: Resources and textures
   var resources: ResourcePack.Resources
   var blockArrayTexture: MTLTexture
   var blockTexturePaletteAnimationState: TexturePaletteAnimationState
   
-  var world: World
-  var client: Client
-  var chunkRenderers: [ChunkPosition: ChunkRenderer] = [:]
+  // MARK: Meshes
   
+  var chunkMeshes: [ChunkPosition: [Int: ChunkSectionMesh]] = [:]
+  
+  let maximumPreparingMeshes = 4
+  var preparingMeshesCounter = Counter(0)
+  var meshPreparationQueue = DispatchQueue(label: "dev.stackotter.delta-client.WorldRenderer.meshPreparationQueue", attributes: .concurrent)
+  var meshesAccessQueue = DispatchQueue(label: "dev.stackotter.delta-client.WorldRenderer.meshAccessQueue")
+  var sectionsToPrepare: [ChunkSectionPosition] = []
+  
+  // MARK: Uniforms
+  
+  // TODO: make generic triple buffer type
   var worldUniformBuffers: [MTLBuffer] = []
   var numWorldUniformBuffers = 3
   var worldUniformBufferIndex = 0
   
-  /// A set containing all chunks which are currently preparing.
-  var preparingChunks: Set<ChunkPosition> = []
+  // MARK: Init
   
   init(device: MTLDevice, world: World, client: Client, resources: ResourcePack.Resources, commandQueue: MTLCommandQueue) throws {
     // Load shaders
@@ -57,159 +71,354 @@ class WorldRenderer {
     let blockTexturePalette = resources.blockTexturePalette
     blockTexturePaletteAnimationState = TexturePaletteAnimationState(for: blockTexturePalette)
     blockArrayTexture = try Self.createArrayTexture(palette: blockTexturePalette, animationState: blockTexturePaletteAnimationState, device: device, commandQueue: commandQueue)
-    transparentAndOpaquePipelineState = try Self.createRenderPipelineState(vertex: vertex, fragment: fragment, device: device, translucent: false)
-    translucentPipelineState = try Self.createRenderPipelineState(vertex: vertex, fragment: fragment, device: device, translucent: true)
+    renderPipelineState = try Self.createRenderPipelineState(vertex: vertex, fragment: fragment, device: device)
     depthState = try Self.createDepthState(device: device)
     worldUniformBuffers = try Self.createWorldUniformBuffers(device: device, count: numWorldUniformBuffers)
+    
+    client.eventBus.registerHandler(handle)
+    
+    // Prepare meshes for the chunks already in the world. It's async, don't worry.
+    for (position, _) in world.chunks {
+      for sectionPosition in position.sections {
+        prepareMeshAsync(forSectionAt: sectionPosition)
+      }
+    }
   }
   
-  private static func createWorldUniformBuffers(device: MTLDevice, count: Int) throws -> [MTLBuffer] {
-    var buffers: [MTLBuffer] = []
-    for _ in 0..<count {
-      guard let uniformBuffer = device.makeBuffer(length: MemoryLayout<Uniforms>.stride, options: []) else {
-        throw RenderError.failedtoCreateWorldUniformBuffers
+  // MARK: Meshes
+  
+  
+  /// A thread-safe counter
+  public struct Counter {
+    private var queue = DispatchQueue(label: "dev.stackotter.delta-client.Counter", attributes: .concurrent)
+    
+    private var _value: Int
+    
+    public var value: Int {
+      get {
+        return queue.sync {
+          return self._value
+        }
+      }
+      set(newValue) {
+        queue.sync(flags: [.barrier]) {
+          self._value = newValue
+        }
+      }
+    }
+    
+    public init(_ initialValue: Int) {
+      _value = initialValue
+    }
+    
+    public mutating func increment() {
+      value += 1
+    }
+    
+    public mutating func decrement() {
+      value -= 1
+    }
+  }
+  
+  /// Prepare a mesh for a chunk section and then add it to be rendered (unless it's empty).
+  ///
+  /// If the mesh can't be prepared immediately (i.e. there are already multiple meshes preparing), then the section is
+  /// added to `sectionsToPrepare` and is prepared at the next opportunity. Each time a mesh finishes preparing,
+  /// `sectionsToPrepare` is sorted by distance from player (and also whether the sections are in the frustum), and the next
+  /// one starts preparing. Reuses the resources of the existing mesh at that position if possible.
+  ///
+  /// - Parameters:
+  ///   - sectionPosition: Position of chunk section to create mesh for.
+  func prepareMeshAsync(forSectionAt sectionPosition: ChunkSectionPosition) {
+    // TODO: use world snapshots
+    meshPreparationQueue.async {
+      // Limits the number of meshes preparing at once for performance reasons (too many at once affects fps)
+      var existingMesh: ChunkSectionMesh? = nil
+      var delayed = false
+      self.meshesAccessQueue.sync {
+        guard self.preparingMeshesCounter.value < self.maximumPreparingMeshes else {
+          delayed = true
+          self.sectionsToPrepare.append(sectionPosition)
+          return
+        }
+        
+        self.preparingMeshesCounter.increment()
+        existingMesh = self.chunkMeshes[sectionPosition.chunk]?[sectionPosition.sectionY]
       }
       
-      uniformBuffer.label = "worldUniformBuffer"
-      buffers.append(uniformBuffer)
-    }
-    return buffers
-  }
-  
-  private static func createDepthState(device: MTLDevice) throws -> MTLDepthStencilState {
-    let depthDescriptor = MTLDepthStencilDescriptor()
-    depthDescriptor.depthCompareFunction = .lessEqual
-    depthDescriptor.isDepthWriteEnabled = true
-    
-    guard let depthState = device.makeDepthStencilState(descriptor: depthDescriptor) else {
-      log.critical("Failed to create depth stencil state")
-      throw RenderError.failedToCreateWorldDepthStencilState
-    }
-    
-    return depthState
-  }
-  
-  private static func createRenderPipelineState(vertex: MTLFunction, fragment: MTLFunction, device: MTLDevice, translucent: Bool) throws -> MTLRenderPipelineState {
-    let pipelineStateDescriptor = MTLRenderPipelineDescriptor()
-    pipelineStateDescriptor.label = "dev.stackotter.delta-client.WorldRenderer\(translucent ? "-translucent" : "")"
-    pipelineStateDescriptor.vertexFunction = vertex
-    pipelineStateDescriptor.fragmentFunction = fragment
-    pipelineStateDescriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
-    pipelineStateDescriptor.depthAttachmentPixelFormat = .depth32Float
-    
-    if translucent {
-      // Setup blending operation
-      pipelineStateDescriptor.colorAttachments[0].isBlendingEnabled = true
-      pipelineStateDescriptor.colorAttachments[0].rgbBlendOperation = .add
-      pipelineStateDescriptor.colorAttachments[0].alphaBlendOperation = .add
-      pipelineStateDescriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
-      pipelineStateDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .zero
-      pipelineStateDescriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
-      pipelineStateDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .zero
-    }
-    
-    do {
-      return try device.makeRenderPipelineState(descriptor: pipelineStateDescriptor)
-    } catch {
-      log.critical("Failed to create render pipeline state")
-      throw RenderError.failedToCreateWorldRenderPipelineState(error)
-    }
-  }
-  
-  private static func createArrayTexture(palette: TexturePalette, animationState: TexturePaletteAnimationState, device: MTLDevice, commandQueue: MTLCommandQueue) throws -> MTLTexture {
-    do {
-      return try palette.createTextureArray(
-        device: device,
-        animationState: animationState,
-        commandQueue: commandQueue)
-    } catch {
-      log.critical("Failed to create texture array: \(error)")
-      throw RenderError.failedToCreateBlockTextureArray(error)
-    }
-  }
-  
-  /// Handles a batch of world events.
-  func handle(_ events: [Event]) {
-    var sectionsToUpdate: Set<ChunkSectionPosition> = []
-    
-    events.forEach { event in
-      switch event {
-        case let event as World.Event.AddChunk:
-          handleAddChunk(event)
-        case let event as World.Event.RemoveChunk:
-          handleRemoveChunk(event)
-        case let chunkLightingUpdate as World.Event.UpdateChunkLighting:
-          handleLightingUpdate(chunkLightingUpdate)
-        case let blockUpdate as World.Event.SetBlock:
-          let affectedSections = sectionsAffected(by: blockUpdate)
-          sectionsToUpdate.formUnion(affectedSections)
-        case let chunkUpdate as World.Event.UpdateChunk:
-          // TODO: only remesh updated chunks
-          for sectionIndex in 0..<16 {
-            let sectionPosition = ChunkSectionPosition(chunkUpdate.position, sectionY: sectionIndex)
-            let neighbours = sectionsNeighbouring(sectionAt: sectionPosition)
-            sectionsToUpdate.formUnion(neighbours)
-          }
-        default:
-          break
+      if delayed {
+        return
       }
-    }
-    
-    // Update all necessary section meshes
-    sectionsToUpdate.forEach { section in
-      if let chunkRenderer = chunkRenderers[section.chunk] {
-        chunkRenderer.handleSectionUpdate(at: section.sectionY)
+      
+      // Get chunks required
+      let chunkPosition = sectionPosition.chunk
+      let neighbourChunks = self.world.neighbours(ofChunkAt: chunkPosition)
+      guard let chunk = self.world.chunk(at: sectionPosition.chunk) else {
+        log.warning("Failed to get chunks to prepare mesh for chunk section at \(sectionPosition)")
+        return
       }
-    }
-  }
-  
-  /// Creates renderers for all chunks that are renderable after the given update.
-  func handleAddChunk(_ event: World.Event.AddChunk) {
-    let affectedPositions = event.position.andNeighbours
-    for position in affectedPositions {
-      if canRenderChunk(at: position) && !chunkRenderers.keys.contains(position) {
-        if let neighbour = world.chunk(at: position) {
-          let neighbours = world.neighbours(ofChunkAt: position)
-          
-          let chunkRenderer = ChunkRenderer(
-            for: neighbour,
-            at: position,
-            withNeighbours: neighbours,
-            with: resources)
-          chunkRenderers[position] = chunkRenderer
-          log.debug("Created chunk renderer for chunk at \(position)")
+      
+      // Build mesh
+      let builder = ChunkSectionMeshBuilder(
+        forSectionAt: sectionPosition,
+        in: chunk,
+        withNeighbours: neighbourChunks,
+        resources: self.resources)
+      if let mesh = builder.build(reusing: existingMesh) {
+        self.addMesh(at: sectionPosition, mesh)
+      }
+      
+      self.preparingMeshesCounter.decrement()
+      
+      // Prepare next mesh if there are any queued
+      self.meshesAccessQueue.async {
+        if !self.sectionsToPrepare.isEmpty {
+          self.sectionsToPrepare = self.sortMeshPositions(camera: self.camera, meshPositions: self.sectionsToPrepare, visibleOnly: false)
+          let nextMeshPosition = self.sectionsToPrepare.removeFirst()
+          self.prepareMeshAsync(forSectionAt: nextMeshPosition)
         }
       }
     }
   }
   
-  /// Removes all renderers made invalid by a given chunk removal.
-  func handleRemoveChunk(_ event: World.Event.RemoveChunk) {
-    let affectedChunks = event.position.andNeighbours
-    for chunkPosition in affectedChunks {
-      chunkRenderers.removeValue(forKey: chunkPosition)
+  /// Add a mesh to the renderer. Replaces any existing mesh at that position.
+  /// - Parameters:
+  ///   - position: Position mesh should be inserted at.
+  ///   - mesh: Chunk section mesh to add.
+  func addMesh(at position: ChunkSectionPosition, _ mesh: ChunkSectionMesh) {
+    let chunkPosition = position.chunk
+    self.meshesAccessQueue.sync {
+      if var sectionMeshes = chunkMeshes[chunkPosition] {
+        sectionMeshes[position.sectionY] = mesh
+        chunkMeshes[chunkPosition] = sectionMeshes
+      } else {
+        chunkMeshes[chunkPosition] = [position.sectionY: mesh]
+      }
     }
   }
   
-  /// Handles a chunk lighting update.
-  func handleLightingUpdate(_ event: World.Event.UpdateChunkLighting) {
-    if let chunk = world.chunk(at: event.position) {
-      if let renderer = chunkRenderers[event.position] {
-        // TODO: only update sections affected by the lighting update
-        renderer.invalidateMeshes()
-      } else {
-        let addChunkEvent = World.Event.AddChunk(
-          position: event.position,
-          chunk: chunk)
-        handleAddChunk(addChunkEvent)
+  /// They are sorted by distance from the player and then the visible ones are put first.
+  ///
+  /// The visibility check is only approximate. All visible meshes will be included, but some false
+  /// positives may occur in certain situations.
+  ///
+  /// - Parameter camera: The camera that is being rendered from. Used to determine which sections are in view from the camera.
+  /// - Parameter meshPositions: The positions of all meshes that should be sorted and filtered to find visible positions.
+  /// - Parameter visibleOnly: If `true`, only visible mesh positions are returned.
+  /// - Returns: The sorted mesh positions.
+  func sortMeshPositions(camera: Camera, meshPositions: [ChunkSectionPosition], visibleOnly: Bool = false) -> [ChunkSectionPosition] {
+    let playerPosition = client.server?.player.position ?? EntityPosition(x: 0, y: 0, z: 0)
+    
+    // Sort meshes by distance from player
+    let offset = SIMD3<Float>(Float(Chunk.width), Float(Chunk.height), Float(Chunk.depth)) / 2
+    let playerPositionVector = playerPosition.vector
+    var sortedMeshPositions = meshPositions.sorted {
+      // Get center position of each chunk section
+      let point1 = SIMD3<Float>(
+        Float($0.sectionX * Chunk.width),
+        Float($0.sectionY * Chunk.height),
+        Float($0.sectionZ * Chunk.depth)) + offset
+      let point2 = SIMD3<Float>(
+        Float($1.sectionX * Chunk.width),
+        Float($1.sectionY * Chunk.height),
+        Float($1.sectionZ * Chunk.depth)) + offset
+      
+      // Get distances from camera
+      let distance1 = simd_distance_squared(playerPositionVector, point1)
+      let distance2 = simd_distance_squared(playerPositionVector, point2)
+      return distance2 < distance1
+    }
+    
+    // Get visible meshes
+    let playerChunkPosition = playerPosition.chunk
+    let visibleMeshPositions = sortedMeshPositions.filter { position in
+      let distance = max(
+        abs(playerChunkPosition.chunkX - position.sectionX),
+        abs(playerChunkPosition.chunkZ - position.sectionZ))
+      return distance < client.renderDistance && camera.isChunkSectionVisible(at: position)
+    }
+    
+    if visibleOnly {
+      return visibleMeshPositions
+    }
+    
+    // Put visible mesh positions first
+    let visibleMeshPositionsSet = Set(visibleMeshPositions)
+    sortedMeshPositions = sortedMeshPositions.sorted {
+      !(!visibleMeshPositionsSet.contains($0) && visibleMeshPositionsSet.contains($1))
+    }
+    
+    return sortedMeshPositions
+  }
+  
+  // MARK: Rendering
+  
+  /// Renders the currently visible chunks.
+  /// - Parameters:
+  ///   - device: Graphics device to use.
+  ///   - view: View that is getting rendered in.
+  ///   - commandBuffer: Command buffer to use for rendering geometry.
+  ///   - camera: Camera to render from.
+  ///   - commandQueue: Command queue to use. Used for blit operations such as updating animated textures.
+  func render(
+    device: MTLDevice,
+    view: MTKView,
+    commandBuffer: MTLCommandBuffer,
+    camera: Camera,
+    commandQueue: MTLCommandQueue
+  ) {
+    self.camera = camera
+    
+    // Update animated textures
+    let updatedTextures = blockTexturePaletteAnimationState.update(tick: client.getClientTick())
+    stopwatch.startMeasurement("update texture")
+    resources.blockTexturePalette.updateArrayTexture(
+      arrayTexture: blockArrayTexture,
+      device: device,
+      animationState: blockTexturePaletteAnimationState,
+      updatedTextures: updatedTextures,
+      commandQueue: commandQueue)
+    stopwatch.stopMeasurement("update texture")
+    
+    let uniformsBuffer = getUniformsBuffer(for: camera)
+    
+    stopwatch.startMeasurement("get visible chunks")
+    // Get the positions of all meshes
+    var meshPositions: [ChunkSectionPosition] = []
+    for (chunkPosition, sectionMeshes) in chunkMeshes {
+      for (sectionY, _) in sectionMeshes {
+        meshPositions.append(ChunkSectionPosition(chunkPosition, sectionY: sectionY))
       }
     }
+    
+    // Sort all mesh positions and only include visible ones
+    let visibleMeshes = sortMeshPositions(camera: camera, meshPositions: meshPositions, visibleOnly: true)
+    
+    sectionsToPrepare = sortMeshPositions(camera: camera, meshPositions: sectionsToPrepare, visibleOnly: false)
+    stopwatch.stopMeasurement("get visible chunks")
+    
+    // Get the render pass descriptor as late as possible
+    guard
+      let renderPassDescriptor = view.currentRenderPassDescriptor,
+      let drawableTexture = renderPassDescriptor.colorAttachments[0].texture
+    else {
+      log.warning("Failed to get current render pass descriptor and drawable texture")
+      return
+    }
+    
+    // Create render descriptor
+    let renderDescriptor = MTLRenderPassDescriptor()
+    renderDescriptor.colorAttachments[0].texture = drawableTexture
+    renderDescriptor.colorAttachments[0].loadAction = .clear
+    renderDescriptor.colorAttachments[0].storeAction = .store
+    renderDescriptor.depthAttachment = renderPassDescriptor.depthAttachment
+    renderDescriptor.depthAttachment.loadAction = .load
+    
+    // Create encoder
+    let encoder: MTLRenderCommandEncoder
+    do {
+      encoder = try Self.createRenderEncoder(
+        depthState: depthState,
+        commandBuffer: commandBuffer,
+        renderPassDescriptor: renderPassDescriptor,
+        pipelineState: renderPipelineState)
+    } catch {
+      log.warning("Failed to create render command encoder; \(error)")
+      return
+    }
+    
+    // Encode render pass
+    stopwatch.startMeasurement("encode")
+    encoder.setFragmentTexture(blockArrayTexture, index: 0)
+    encoder.setVertexBuffer(uniformsBuffer, offset: 0, index: 1)
+    
+    do {
+      // Draw transparent and opaque geometry first
+      for sectionPosition in visibleMeshes {
+        try chunkMeshes[sectionPosition.chunk]?[sectionPosition.sectionY]?.renderTransparentAndOpaque(encoder: encoder, device: device, commandQueue: commandQueue)
+      }
+      
+      // Draw translucent geometry last
+      for sectionPosition in visibleMeshes {
+        try chunkMeshes[sectionPosition.chunk]?[sectionPosition.sectionY]?.renderTranslucent(viewedFrom: camera.position, sortTranslucent: true, encoder: encoder, device: device, commandQueue: commandQueue)
+      }
+    } catch {
+      log.error("Failed to render chunk meshes; \(error)")
+    }
+    
+    encoder.endEncoding()
+    stopwatch.stopMeasurement("encode")
+  }
+  
+  // MARK: Event handling
+  
+  /// Handle world events and update meshes as necessary.
+  func handle(_ event: Event) {
+    // TODO: group multiblock updates into one event so only one mesh update.
+    
+    var sectionsToUpdate: Set<ChunkSectionPosition> = []
+    
+    switch event {
+      case let event as World.Event.AddChunk:
+        let affectedChunks = event.position.andNeighbours
+        for chunkPosition in affectedChunks where canRenderChunk(at: chunkPosition) && chunkMeshes[chunkPosition] == nil {
+          sectionsToUpdate.formUnion(chunkPosition.sections)
+        }
+      case let event as World.Event.RemoveChunk:
+        for chunkPosition in event.position.andNeighbours {
+          chunkMeshes[chunkPosition] = nil
+        }
+      case let chunkLightingUpdate as World.Event.UpdateChunkLighting:
+        // TODO: only update meshes affected by the lighting update
+        let affectedChunks = chunkLightingUpdate.position.andNeighbours
+        for chunkPosition in affectedChunks where canRenderChunk(at: chunkPosition) {
+          sectionsToUpdate.formUnion(chunkPosition.sections)
+        }
+      case let blockUpdate as World.Event.SetBlock:
+        let affectedSections = sectionsAffected(by: blockUpdate)
+        sectionsToUpdate.formUnion(affectedSections)
+      case let chunkUpdate as World.Event.UpdateChunk:
+        // TODO: only remesh updated chunk sections
+        for sectionIndex in 0..<16 {
+          let sectionPosition = ChunkSectionPosition(chunkUpdate.position, sectionY: sectionIndex)
+          let neighbours = sectionsNeighbouring(sectionAt: sectionPosition)
+          sectionsToUpdate.formUnion(neighbours)
+        }
+      default:
+        break
+    }
+    
+    // Update all necessary section meshes
+    for sectionPosition in sectionsToUpdate {
+      self.prepareMeshAsync(forSectionAt: sectionPosition)
+    }
+  }
+  
+  // MARK: Helper
+  
+  /// Creates a render encoder.
+  private static func createRenderEncoder(
+    depthState: MTLDepthStencilState,
+    commandBuffer: MTLCommandBuffer,
+    renderPassDescriptor: MTLRenderPassDescriptor,
+    pipelineState: MTLRenderPipelineState
+  ) throws -> MTLRenderCommandEncoder {
+    guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else {
+      throw RenderError.failedToCreateRenderEncoder(pipelineState.label ?? "pipeline")
+    }
+    
+    renderEncoder.setRenderPipelineState(pipelineState)
+    renderEncoder.setDepthStencilState(depthState)
+    renderEncoder.setFrontFacing(.clockwise)
+    renderEncoder.setCullMode(.back)
+    
+    return renderEncoder
   }
   
   /// Returns whether a chunk is ready to be rendered or not.
   ///
   /// To be renderable, a chunk must be complete and so must its neighours.
-  func canRenderChunk(at position: ChunkPosition) -> Bool {
+  private func canRenderChunk(at position: ChunkPosition) -> Bool {
     let chunkPositions = position.andNeighbours
     for chunkPosition in chunkPositions {
       if !world.chunkComplete(at: chunkPosition) {
@@ -220,7 +429,7 @@ class WorldRenderer {
   }
   
   /// Returns the sections that require re-meshing after the specified block update.
-  func sectionsAffected(by blockUpdate: World.Event.SetBlock) -> [ChunkSectionPosition] {
+  private func sectionsAffected(by blockUpdate: World.Event.SetBlock) -> [ChunkSectionPosition] {
     var affectedSections: [ChunkSectionPosition] = [blockUpdate.position.chunkSection]
     
     let updateRelativeToChunk = blockUpdate.position.relativeToChunk
@@ -260,7 +469,7 @@ class WorldRenderer {
   }
   
   /// Returns the positions of all valid chunk sections that neighbour the specific chunk section.
-  func sectionsNeighbouring(sectionAt sectionPosition: ChunkSectionPosition) -> [ChunkSectionPosition] {
+  private func sectionsNeighbouring(sectionAt sectionPosition: ChunkSectionPosition) -> [ChunkSectionPosition] {
     var northNeighbour = sectionPosition
     northNeighbour.sectionZ -= 1
     var eastNeighbour = sectionPosition
@@ -286,245 +495,78 @@ class WorldRenderer {
     return neighbours
   }
   
-  /// Returns a map from each cardinal direction to the given renderer's neighbour in that direction.
-  func getNeighbourRenderers(of renderer: ChunkRenderer) -> [CardinalDirection: ChunkRenderer] {
-    var neighbourRenderers: [CardinalDirection: ChunkRenderer] = [:]
-    renderer.chunkPosition.allNeighbours.forEach { direction, neighbourPosition in
-      if let neighbourRenderer = chunkRenderers[neighbourPosition] {
-        neighbourRenderers[direction] = neighbourRenderer
-      }
-    }
-    return neighbourRenderers
-  }
-  
-  func createWorldUniforms(for camera: Camera) -> Uniforms {
+  /// Gets the current world uniforms buffer and populates it with the transformation matrix for the given camera.
+  private func getUniformsBuffer(for camera: Camera) -> MTLBuffer {
     let worldToClipSpace = camera.getFrustum().worldToClip
-    return Uniforms(transformation: worldToClipSpace)
-  }
-  
-  func populateWorldUniformBuffer(_ buffer: inout MTLBuffer, with uniforms: inout Uniforms) {
-    buffer.contents().copyMemory(from: &uniforms, byteCount: MemoryLayout<Uniforms>.stride)
-  }
-  
-  /// Decides whether to process a world event this frame.
-  func shouldProcessWorldEvent(event: Event) -> Bool {
-    switch event {
-      case let blockUpdate as World.Event.SetBlock:
-        // Postpone handling of the block update if it affects a frozen chunk section
-        let affectedSections = sectionsAffected(by: blockUpdate)
-        for section in affectedSections {
-          if let renderer = chunkRenderers[section.chunk] {
-            if renderer.sectionFrozen(at: section.sectionY) {
-              return false
-            }
-          }
-        }
-        return true
-      case let chunkUpdate as World.Event.UpdateChunk:
-        // Postpone handling of the chunk update if any of the affected sections are are frozen
-        if let renderer = chunkRenderers[chunkUpdate.position] {
-          let neighbourRenderers = getNeighbourRenderers(of: renderer)
-          for index in 0..<16 {
-            if renderer.sectionFrozen(at: index - 1) || renderer.sectionFrozen(at: index + 1) {
-              return false
-            }
-            for (_, renderer) in neighbourRenderers {
-              if renderer.sectionFrozen(at: index) {
-                return false
-              }
-            }
-          }
-        }
-        return true
-      case let chunkLightingUpdate as World.Event.UpdateChunkLighting:
-        // Postpone handling of a lighting update if the chunk of any of its neighbours contain frozen sections
-        let affectedChunks = chunkLightingUpdate.position.andNeighbours
-        for chunkPosition in affectedChunks {
-          if let renderer = chunkRenderers[chunkPosition] {
-            if renderer.frozenSectionCount != 0 {
-              return false
-            }
-          }
-        }
-        return true
-      default:
-        return true
-    }
-  }
-  
-  /// Also handles block updates.
-  func getVisibleChunkRenderers(camera: Camera) -> [ChunkRenderer] {
-    // Filter and handle world events
-    let events = world.processBatch(filter: shouldProcessWorldEvent)
-    handle(events)
-    
-    // Filter out chunks outside of render distance
-    let playerChunkPosition = client.server?.player.position.chunkPosition ?? ChunkPosition(chunkX: 0, chunkZ: 0)
-    let chunkRenderersInRenderDistance = [ChunkRenderer](chunkRenderers.values).filter { renderer in
-      let distance = max(
-        abs(playerChunkPosition.chunkX - renderer.chunkPosition.chunkX),
-        abs(playerChunkPosition.chunkZ - renderer.chunkPosition.chunkZ))
-      return distance < client.renderDistance
-    }
-    
-    // Sort chunks by distance from player
-    let cameraPosition2d = SIMD2<Float>(camera.position.x, camera.position.z)
-    var sortedChunkRenderers = chunkRenderersInRenderDistance.sorted {
-      let point1 = SIMD2<Float>(
-        Float($0.chunkPosition.chunkX) * Float(Chunk.width),
-        Float($0.chunkPosition.chunkZ) * Float(Chunk.depth))
-      let point2 = SIMD2<Float>(
-        Float($1.chunkPosition.chunkX) * Float(Chunk.width),
-        Float($1.chunkPosition.chunkZ) * Float(Chunk.depth))
-      let distance1 = simd_distance_squared(cameraPosition2d, point1)
-      let distance2 = simd_distance_squared(cameraPosition2d, point2)
-      return distance2 > distance1
-    }
-    
-    // Get visible chunks
-    let visibleChunks = sortedChunkRenderers.map { $0.chunkPosition }.filter { chunkPosition in
-      return camera.isChunkVisible(at: chunkPosition)
-    }
-    
-    // Put visible chunks first
-    sortedChunkRenderers.sort {
-      return visibleChunks.contains($0.chunkPosition) && !visibleChunks.contains($1.chunkPosition)
-    }
-    
-    // Remove prepared chunks from preparing chunks
-    preparingChunks.forEach { chunkPosition in
-      if let chunkRenderer = chunkRenderers[chunkPosition] {
-        if chunkRenderer.hasCompletedInitialPrepare {
-          log.trace("Removing prepared chunk at \(chunkPosition) from preparingChunks")
-          preparingChunks.remove(chunkPosition)
-        }
-      }
-    }
-    
-    let chunksToPrepare = sortedChunkRenderers.filter { chunkRenderer in
-      return chunkRenderer.requiresPreparing
-    }
-    
-    // Prepare chunks that require preparing and freeze any updates for them
-    for chunkRenderer in chunksToPrepare {
-      if preparingChunks.count == 3 {
-        break
-      }
-      preparingChunks.insert(chunkRenderer.chunkPosition)
-      chunkRenderer.prepareAsync()
-    }
-    
-    // Get ChunkRenderers which are ready to be rendered
-    let renderersToRender = sortedChunkRenderers.filter { chunkRenderer in
-      return visibleChunks.contains(chunkRenderer.chunkPosition)
-    }
-    
-    return renderersToRender
-  }
-  
-  func updateAndGetUniformsBuffer(for camera: Camera) -> MTLBuffer {
-    var worldUniforms = createWorldUniforms(for: camera)
-    var buffer = worldUniformBuffers[worldUniformBufferIndex]
+    var worldUniforms = Uniforms(transformation: worldToClipSpace)
+    let buffer = worldUniformBuffers[worldUniformBufferIndex]
     worldUniformBufferIndex = (worldUniformBufferIndex + 1) % worldUniformBuffers.count
-    populateWorldUniformBuffer(&buffer, with: &worldUniforms)
+    buffer.contents().copyMemory(from: &worldUniforms, byteCount: MemoryLayout<Uniforms>.stride)
     return buffer
   }
   
-  private static func createRenderEncoder(
-    depthState: MTLDepthStencilState,
-    commandBuffer: MTLCommandBuffer,
-    renderPassDescriptor: MTLRenderPassDescriptor,
-    pipelineState: MTLRenderPipelineState
-  ) throws -> MTLRenderCommandEncoder {
-    guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else {
-      throw RenderError.failedToCreateRenderEncoder(pipelineState.label ?? "pipeline")
+  // MARK: Init helpers
+  
+  private static func createWorldUniformBuffers(device: MTLDevice, count: Int) throws -> [MTLBuffer] {
+    var buffers: [MTLBuffer] = []
+    for _ in 0..<count {
+      guard let uniformBuffer = device.makeBuffer(length: MemoryLayout<Uniforms>.stride, options: []) else {
+        throw RenderError.failedtoCreateWorldUniformBuffers
+      }
+      
+      uniformBuffer.label = "worldUniformBuffer"
+      buffers.append(uniformBuffer)
     }
-    
-    renderEncoder.setRenderPipelineState(pipelineState)
-    renderEncoder.setDepthStencilState(depthState)
-    renderEncoder.setFrontFacing(.clockwise)
-    renderEncoder.setCullMode(.back)
-    
-    return renderEncoder
+    return buffers
   }
   
-  func draw(
-    device: MTLDevice,
-    view: MTKView,
-    transparentAndOpaqueCommandBuffer: MTLCommandBuffer,
-    translucentCommandBuffer: MTLCommandBuffer,
-    camera: Camera,
-    commandQueue: MTLCommandQueue
-  ) {
-    // Update animated textures
-    let updatedTextures = blockTexturePaletteAnimationState.update(tick: client.getClientTick())
-    stopwatch.startMeasurement("update texture")
-    resources.blockTexturePalette.updateArrayTexture(arrayTexture: blockArrayTexture, device: device, animationState: blockTexturePaletteAnimationState, updatedTextures: updatedTextures, commandQueue: commandQueue)
-    stopwatch.stopMeasurement("update texture")
+  private static func createDepthState(device: MTLDevice) throws -> MTLDepthStencilState {
+    let depthDescriptor = MTLDepthStencilDescriptor()
+    depthDescriptor.depthCompareFunction = .lessEqual
+    depthDescriptor.isDepthWriteEnabled = true
     
-    let uniformsBuffer = updateAndGetUniformsBuffer(for: camera)
-    
-    stopwatch.startMeasurement("get visible chunks")
-    let renderersToRender = getVisibleChunkRenderers(camera: camera)
-    stopwatch.stopMeasurement("get visible chunks")
-    
-    // Get the render pass descriptor as late as possible
-    guard
-      let renderPassDescriptor = view.currentRenderPassDescriptor,
-      let drawableTexture = renderPassDescriptor.colorAttachments[0].texture
-    else {
-      log.warning("Failed to get current render pass descriptor and drawable texture")
-      return
+    guard let depthState = device.makeDepthStencilState(descriptor: depthDescriptor) else {
+      log.critical("Failed to create depth stencil state")
+      throw RenderError.failedToCreateWorldDepthStencilState
     }
     
-    let transparentAndOpaqueRenderDescriptor = renderPassDescriptor
-    transparentAndOpaqueRenderDescriptor.colorAttachments[0].loadAction = .clear
-    let translucentRenderDescriptor = MTLRenderPassDescriptor()
-    translucentRenderDescriptor.colorAttachments[0].texture = drawableTexture
-    translucentRenderDescriptor.colorAttachments[0].loadAction = .load
-    translucentRenderDescriptor.colorAttachments[0].storeAction = .store
-    translucentRenderDescriptor.depthAttachment = renderPassDescriptor.depthAttachment
-    translucentRenderDescriptor.depthAttachment.loadAction = .load
+    return depthState
+  }
+  
+  private static func createRenderPipelineState(vertex: MTLFunction, fragment: MTLFunction, device: MTLDevice) throws -> MTLRenderPipelineState {
+    let pipelineStateDescriptor = MTLRenderPipelineDescriptor()
+    pipelineStateDescriptor.label = "dev.stackotter.delta-client.WorldRenderer"
+    pipelineStateDescriptor.vertexFunction = vertex
+    pipelineStateDescriptor.fragmentFunction = fragment
+    pipelineStateDescriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
+    pipelineStateDescriptor.depthAttachmentPixelFormat = .depth32Float
     
-    // Create encoders
-    let transparentAndOpaqueEncoder: MTLRenderCommandEncoder
-    let translucentEncoder: MTLRenderCommandEncoder
+    // Setup blending operation
+    pipelineStateDescriptor.colorAttachments[0].isBlendingEnabled = true
+    pipelineStateDescriptor.colorAttachments[0].rgbBlendOperation = .add
+    pipelineStateDescriptor.colorAttachments[0].alphaBlendOperation = .add
+    pipelineStateDescriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+    pipelineStateDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .zero
+    pipelineStateDescriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+    pipelineStateDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .zero
+    
     do {
-      transparentAndOpaqueEncoder = try Self.createRenderEncoder(
-        depthState: depthState,
-        commandBuffer: transparentAndOpaqueCommandBuffer,
-        renderPassDescriptor: transparentAndOpaqueRenderDescriptor,
-        pipelineState: transparentAndOpaquePipelineState)
-      
-      translucentEncoder = try Self.createRenderEncoder(
-        depthState: depthState,
-        commandBuffer: translucentCommandBuffer,
-        renderPassDescriptor: translucentRenderDescriptor,
-        pipelineState: translucentPipelineState)
+      return try device.makeRenderPipelineState(descriptor: pipelineStateDescriptor)
     } catch {
-      log.warning("Failed to create render command encoder; \(error)")
-      return
+      log.critical("Failed to create render pipeline state")
+      throw RenderError.failedToCreateWorldRenderPipelineState(error)
     }
-    
-    // Encode render pass
-    stopwatch.startMeasurement("encode")
-    transparentAndOpaqueEncoder.setFragmentTexture(blockArrayTexture, index: 0)
-    transparentAndOpaqueEncoder.setVertexBuffer(uniformsBuffer, offset: 0, index: 1)
-    
-    translucentEncoder.setFragmentTexture(blockArrayTexture, index: 0)
-    translucentEncoder.setVertexBuffer(uniformsBuffer, offset: 0, index: 1)
-    
-    renderersToRender.forEach { chunkRenderer in
-      chunkRenderer.render(
-        transparentAndOpaqueEncoder: transparentAndOpaqueEncoder,
-        translucentEncoder: translucentEncoder,
-        with: device,
-        and: camera,
+  }
+  
+  private static func createArrayTexture(palette: TexturePalette, animationState: TexturePaletteAnimationState, device: MTLDevice, commandQueue: MTLCommandQueue) throws -> MTLTexture {
+    do {
+      return try palette.createTextureArray(
+        device: device,
+        animationState: animationState,
         commandQueue: commandQueue)
+    } catch {
+      log.critical("Failed to create texture array: \(error)")
+      throw RenderError.failedToCreateBlockTextureArray(error)
     }
-    
-    transparentAndOpaqueEncoder.endEncoding()
-    translucentEncoder.endEncoding()
-    stopwatch.stopMeasurement("encode")
   }
 }

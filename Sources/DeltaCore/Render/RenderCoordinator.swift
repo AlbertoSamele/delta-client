@@ -77,20 +77,16 @@ public class RenderCoordinator: NSObject, MTKViewDelegate {
     updatePhysics()
     updateCamera(player, view)
     
-    guard
-      let transparentAndOpaqueCommandBuffer = commandQueue.makeCommandBuffer(),
-      let translucentCommandBuffer = commandQueue.makeCommandBuffer()
-    else {
-      log.warning("Failed to create render command buffers")
+    guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+      log.warning("Failed to create render command buffer")
       return
     }
     
     stopwatch.startMeasurement("world renderer")
-    worldRenderer.draw(
+    worldRenderer.render(
       device: device,
       view: view,
-      transparentAndOpaqueCommandBuffer: transparentAndOpaqueCommandBuffer,
-      translucentCommandBuffer: translucentCommandBuffer,
+      commandBuffer: commandBuffer,
       camera: camera,
       commandQueue: commandQueue)
     stopwatch.stopMeasurement("world renderer")
@@ -100,9 +96,8 @@ public class RenderCoordinator: NSObject, MTKViewDelegate {
       return
     }
     
-    transparentAndOpaqueCommandBuffer.commit()
-    translucentCommandBuffer.present(drawable)
-    translucentCommandBuffer.commit()
+    commandBuffer.present(drawable)
+    commandBuffer.commit()
     
     logFrame()
     stopwatch.stopMeasurement("whole frame")

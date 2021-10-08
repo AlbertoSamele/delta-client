@@ -7,11 +7,6 @@ public struct ChunkPosition {
   /// The chunk's world z divided by 16 and rounded down.
   public var chunkZ: Int
   
-  public init(chunkX: Int, chunkZ: Int) {
-    self.chunkX = chunkX
-    self.chunkZ = chunkZ
-  }
-  
   /// A map from each cardinal direction to each of this position's neighbours.
   public var allNeighbours: [CardinalDirection: ChunkPosition] {
     return [
@@ -26,6 +21,20 @@ public struct ChunkPosition {
     var positionAndNeighbours = [self]
     positionAndNeighbours.append(contentsOf: allNeighbours.values)
     return positionAndNeighbours
+  }
+  
+  /// The positions of all chunk sections contained within this chunk position.
+  public var sections: [ChunkSectionPosition] {
+    var sections: [ChunkSectionPosition] = []
+    for sectionY in 0..<16 {
+      sections.append(ChunkSectionPosition(self, sectionY: sectionY))
+    }
+    return sections
+  }
+  
+  public init(chunkX: Int, chunkZ: Int) {
+    self.chunkX = chunkX
+    self.chunkZ = chunkZ
   }
   
   /// Gets the position of the chunk that neighbours this chunk in the specified direction.

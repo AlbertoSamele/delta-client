@@ -20,25 +20,6 @@ public class Client {
   /// The most recent time this client joined a server (specifically, when the join game packet was received). Used to calculate client tick.
   public var joinServerTime: CFAbsoluteTime?
   
-  // TODO: ABOLISH world update batching, it's confusing and annoying
-  /// Whether to batch world updates or not.
-  private var _batchWorldUpdates = true
-  public var batchWorldUpdates: Bool {
-    get {
-      _batchWorldUpdates
-    }
-    set(newValue) {
-      if newValue != _batchWorldUpdates {
-        if newValue {
-          server?.world.enableBatching()
-        } else {
-          server?.world.disableBatching()
-        }
-        _batchWorldUpdates = newValue
-      }
-    }
-  }
-  
   public var renderDistance = 1
   
   // MARK: Init

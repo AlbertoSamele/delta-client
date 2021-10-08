@@ -25,23 +25,29 @@ public struct ChunkSectionMesh {
     translucentMesh.clear()
   }
   
-  /// Encode the render commands for this chunk section.
+  /// Encode the render commands for this chunk section's opaque and transparent geometry.
   /// - Parameters:
-  ///   - position: Position the mesh is viewed from. Used for sorting.
-  ///   - sortTranslucent: Whether the translucent mesh should be sorted or not.
-  ///   - transparentAndOpaqueEncoder: Encoder for rendering transparent and opaque geometry.
-  ///   - translucentEncoder: Encoder for rendering translucent geometry.
-  ///   - device: The device to use.
-  ///   - commandQueue: The command queue to use for creating buffers.
-  public mutating func render(
-    viewedFrom position: SIMD3<Float>,
-    sortTranslucent: Bool,
-    transparentAndOpaqueEncoder: MTLRenderCommandEncoder,
-    translucentEncoder: MTLRenderCommandEncoder,
+  ///   - commandQueue: Used to create buffers.
+  public mutating func renderTransparentAndOpaque(
+    encoder: MTLRenderCommandEncoder,
     device: MTLDevice,
     commandQueue: MTLCommandQueue
   ) throws {
-    try transparentAndOpaqueMesh.render(into: transparentAndOpaqueEncoder, with: device, commandQueue: commandQueue)
-    try translucentMesh.render(viewedFrom: position, sort: sortTranslucent, encoder: translucentEncoder, device: device, commandQueue: commandQueue)
+    try transparentAndOpaqueMesh.render(into: encoder, with: device, commandQueue: commandQueue)
+  }
+  
+  /// Encode the render commands for this chunk section's translucent geometry.
+  /// - Parameters:
+  ///   - position: Position to sort the geometry from.
+  ///   - sortTranslucent: Whether to sort the geometry or not.
+  ///   - commandQueue: Used to create buffers.
+  public mutating func renderTranslucent(
+    viewedFrom position: SIMD3<Float>,
+    sortTranslucent: Bool,
+    encoder: MTLRenderCommandEncoder,
+    device: MTLDevice,
+    commandQueue: MTLCommandQueue
+  ) throws {
+    try translucentMesh.render(viewedFrom: position, sort: sortTranslucent, encoder: encoder, device: device, commandQueue: commandQueue)
   }
 }
